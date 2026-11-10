@@ -1,0 +1,106 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Room;
+use App\Models\RoomLog;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\View\View;
+use Symfony\Component\HttpFoundation\StreamedResponse;
+use Intervention\Image\Drivers\Gd\Driver;
+use Intervention\Image\ImageManager;
+
+class RoomKeeperController extends Controller
+{
+    public function index(): View
+    {
+        $rooms = Room::with(['roomType', 'roomLogs' => fn ($q) => $q->whereNotNull('proof_photo')->latest()->limit(1)])
+            ->orderByRaw("CASE status WHEN 'dirty' THEN 0 WHEN 'maintenance' THEN 1 WHEN 'occupied' THEN 2 WHEN 'available' THEN 3 ELSE 4 END")
+            ->orderBy('room_number')
+            ->get();
+
+        return view('room-keeper.index', compact('rooms'));
+    }
+
+    /**
+     * Update status kebersihan (dirty -> clean/available) dan catat log.
+     */
+    public function updateStatus(Request $request, Room $room): RedirectResponse|JsonResponse
+    {
+        $data = $request->validate([
+            'status_reported' => ['required', 'in:dirty,clean,maintenance'],
+            'notes' => ['nullable', 'string', 'max:500'],
+            'proof_photo' => [
+                'image',
+                'max:4096',
+                // Wajib untuk clean & maintenance, opsional untuk dirty.
+                in_array($request->input('status_reported'), ['clean', 'maintenance'], true) ? 'required' : 'nullable',
+            ],
+        ], [
+            'proof_photo.required' => 'Foto bukti wajib diupload untuk status ini.',
+            'proof_photo.image' => 'Foto bukti harus berupa gambar.',
+            'proof_photo.max' => 'Ukuran foto bukti maksimal 4MB.',
+        ]);
+
+        DB::transaction(function () use ($data, $room, $request) {
+            $proofPath = null;
+
+            if ($request->hasFile('proof_photo')) {
+                // Kompresi agresif: maks lebar 800px, kualitas 60%.
+                // Foto bukti kerja, bukan dokumen identitas (hemat storage 1GB).
+                $manager = new ImageManager(new Driver());
+                $image = $manager->read($request->file('proof_photo'));
+                $image->scaleDown(800);
+                $encoded = $image->toJpeg(60);
+                $proofPath = 'room-proofs/' . uniqid() . '.jpg';
+                Storage::disk('private')->put($proofPath, (string) $encoded);
+            }
+
+            RoomLog::create([
+                'room_id' => $room->id,
+                'user_id' => auth()->id(),
+                'status_reported' => $data['status_reported'],
+                'notes' => $data['notes'] ?? null,
+                'proof_photo' => $proofPath,
+            ]);
+
+            // "clean" pada log berarti kamar siap dipakai lagi -> available
+            $newRoomStatus = $data['status_reported'] === 'clean'
+                ? Room::STATUS_AVAILABLE
+                : $data['status_reported'];
+
+            $room->update(['status' => $newRoomStatus]);
+        });
+
+        // Retensi foto: jaga folder tetap maks 1000 file (hapus paling lama).
+        \App\Support\PhotoRetention::prune(
+            'room-proofs',
+            (int) config('retention.media.room-proofs.max_files', 5000),
+            (int) config('retention.media.room-proofs.max_bytes', 300 * 1024 * 1024)
+        );
+
+        $redirect = back()->with('success', 'Status kamar berhasil diperbarui.');
+
+        // Respons AJAX (submit via FormData dari kamera HP): balikkan URL tujuan.
+        if ($request->expectsJson()) {
+            return response()->json(['redirect' => route('room-keeper.index')]);
+        }
+
+        return $redirect;
+    }
+
+    /**
+     * Streaming foto bukti kerja dari disk private (bukan URL publik).
+     * Bisa diakses owner, resepsionis, dan room keeper.
+     */
+    public function proofPhoto(RoomLog $roomLog): StreamedResponse
+    {
+        abort_unless($roomLog->proof_photo, 404);
+
+        return Storage::disk('private')->response($roomLog->proof_photo);
+    }
+}
